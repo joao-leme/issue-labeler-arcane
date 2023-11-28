@@ -1,7 +1,7 @@
 import { getInput, setFailed, debug, setOutput } from "@actions/core";
 import { context, getOctokit } from "@actions/github";
 import { load as loadYaml } from "js-yaml";
-import fs from "fs";
+import * as fs from "fs";
 
 type GitHubClient = ReturnType<typeof getOctokit>["rest"];
 
@@ -11,10 +11,10 @@ async function run() {
   configPath = getInput("configuration-path", { required: true });
   const token = getInput("repo-token", { required: true });
   const enableVersionedRegex = parseInt(
-    getInput("enable-versioned-regex", { required: true })
+    getInput("enable-versioned-regex", { required: true }),
   );
   const versionedRegex = new RegExp(
-    getInput("versioned-regex", { required: false })
+    getInput("versioned-regex", { required: false }),
   );
   const notBefore = Date.parse(getInput("not-before", { required: false }));
   const bodyMissingRegexLabel = getInput("body-missing-regex-label", {
@@ -24,7 +24,7 @@ async function run() {
   const includeBody = parseInt(getInput("include-body", { required: false }));
   const syncLabels = parseInt(getInput("sync-labels", { required: false }));
 
-  const issue_number = parseInt(getInput("issue-number", { required: true }))
+  const issue_number = parseInt(getInput("issue-number", { required: true }));
 
   // A client to load data from GitHub
   const { rest: client } = getOctokit(token);
@@ -52,9 +52,9 @@ async function run() {
     return;
   }
 
-  const labels: String[] = []
+  const labels: String[] = [];
   issue.data.labels.forEach((label) => {
-    if (typeof label === 'string') {
+    if (typeof label === "string") {
     } else {
       labels.push(<String>label.name);
     }
@@ -69,7 +69,7 @@ async function run() {
         await addLabels(client, issue_number, [bodyMissingRegexLabel]);
       }
       console.log(
-        `Issue #${issue_number} does not contain regex version in the body of the issue, exiting.`
+        `Issue #${issue_number} does not contain regex version in the body of the issue, exiting.`,
       );
       return;
     } else if (bodyMissingRegexLabel) {
@@ -83,7 +83,7 @@ async function run() {
     const issueCreatedAt = Date.parse(issue.data.created_at);
     if (issueCreatedAt < notBefore) {
       console.log(
-        "Issue is before `notBefore` configuration parameter. Exiting..."
+        "Issue is before `notBefore` configuration parameter. Exiting...",
       );
       return;
     }
@@ -119,7 +119,7 @@ async function run() {
     .filter(Boolean);
 
   if (rejected.length) {
-    throw new AggregateError(rejected)
+    throw new AggregateError(rejected);
   }
 
   if (toAdd.length) {
@@ -134,7 +134,7 @@ async function run() {
 function getIssueOrPRBody() {
   const { issue, pull_request } = context.payload;
   if (issue?.body === null || pull_request?.body === null) {
-    return '';
+    return "";
   }
   return issue?.body ?? pull_request?.body;
 }
@@ -150,16 +150,20 @@ function regexifyConfigPath(configPath: string, version: string) {
 }
 
 /** Load the configuration file */
-async function loadConfig(client: GitHubClient, configPath: string) {
+export async function loadConfig(client: GitHubClient, configPath: string) {
   try {
-    let configContent: string
+    let configContent: string;
 
     if (fs.existsSync(configPath)) {
-      console.log(`Configuration file (path: ${configPath}) exists locally, loading from file`);
+      console.log(
+        `Configuration file (path: ${configPath}) exists locally, loading from file`,
+      );
 
       configContent = fs.readFileSync(configPath, { encoding: "utf8" });
     } else {
-      console.log(`Configuration file (path: ${configPath}) does not exist locally, fetching via the API`);
+      console.log(
+        `Configuration file (path: ${configPath}) does not exist locally, fetching via the API`,
+      );
 
       const { data } = await client.repos.getContent({
         owner: context.repo.owner,
@@ -170,13 +174,13 @@ async function loadConfig(client: GitHubClient, configPath: string) {
 
       if (!("content" in data)) {
         throw new TypeError(
-          "The configuration path provided is not a valid file. Exiting"
+          "The configuration path provided is not a valid file. Exiting",
         );
       }
 
       configContent = Buffer.from(data.content, "base64").toString("utf8");
     }
-  
+
     // loads (hopefully) a `{[label:string]: string | string[]}`, but is `any`:
     const configObject = loadYaml(configContent);
 
@@ -188,16 +192,33 @@ async function loadConfig(client: GitHubClient, configPath: string) {
   }
 }
 
+interface RuleSet {
+  oneOf: string[];
+  allOf: string[];
+  exclude: string[];
+}
+
 function getLabelRegexesMapFromObject(configObject: any) {
-  const labelRegexes = new Map<string, string[]>();
+  const labelRegexes = new Map<string, RuleSet>();
   for (const label in configObject) {
-    if (typeof configObject[label] === "string") {
-      labelRegexes.set(label, [configObject[label]]);
-    } else if (Array.isArray(configObject[label])) {
-      labelRegexes.set(label, configObject[label]);
+    let baseRuleSet = {
+      oneOf: [],
+      allOf: [],
+      exclude: [],
+    };
+    const value = configObject[label];
+    if (typeof value === "string") {
+      labelRegexes.set(label, { oneOf: [value], allOf: [], exclude: [] });
+    } else if (Array.isArray(value)) {
+      labelRegexes.set(label, { oneOf: value, allOf: [], exclude: [] });
+    } else if (
+      typeof value === "object" &&
+      (value.oneOf || value.allOf || value.exclude)
+    ) {
+      labelRegexes.set(label, { ...baseRuleSet, ...value });
     } else {
       throw Error(
-        `found unexpected type for label ${label} (should be string or array of regex)`
+        `found unexpected type for label ${label} (should be string or array of regex)`,
       );
     }
   }
@@ -205,30 +226,65 @@ function getLabelRegexesMapFromObject(configObject: any) {
   return labelRegexes;
 }
 
-function checkRegexes(issue_body: string, regexes: string[]) {
-  let found;
+export function checkRegexes(issue_body: string, regexes: RuleSet) {
+  let foundsIncludeAny = [];
+  let foundsIncludeAll = [];
+  let foundsExcludeAny = [];
 
-  // If several regex entries are provided we require all of them to match for the label to be applied.
-  for (const regEx of regexes) {
+  // Check includeAny
+  for (const regEx of regexes.oneOf) {
     const isRegEx = regEx.match(/^\/(.+)\/(.*)$/);
-
+    let found;
     if (isRegEx) {
       found = issue_body.match(new RegExp(isRegEx[1], isRegEx[2]));
     } else {
       found = issue_body.match(regEx);
     }
-
-    if (!found) {
-      return false;
-    }
+    foundsIncludeAny.push(found);
   }
-  return true;
+
+  // Check includeAll
+  for (const regEx of regexes.allOf) {
+    const isRegEx = regEx.match(/^\/(.+)\/(.*)$/);
+    let found;
+    if (isRegEx) {
+      found = issue_body.match(new RegExp(isRegEx[1], isRegEx[2]));
+    } else {
+      found = issue_body.match(regEx);
+    }
+    foundsIncludeAll.push(found);
+  }
+
+  // Check excludeAny
+  for (const regEx of regexes.exclude) {
+    const isRegEx = regEx.match(/^\/(.+)\/(.*)$/);
+    let found;
+    if (isRegEx) {
+      found = issue_body.match(new RegExp(isRegEx[1], isRegEx[2]));
+    } else {
+      found = issue_body.match(regEx);
+    }
+    foundsExcludeAny.push(found);
+  }
+
+  // If any regex in includeAny matches or all regexes in includeAll match, it's valid
+  // If any regex in excludeAny matches, it's not valid
+  if (
+    (foundsIncludeAny.some((found) => found) ||
+      (foundsIncludeAll.length > 0 &&
+        foundsIncludeAll.every((found) => found))) &&
+    !foundsExcludeAny.some((found) => found)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 async function addLabels(
   client: GitHubClient,
   issue_number: number,
-  labels: string[]
+  labels: string[],
 ) {
   try {
     const formatted = labels.map((l) => `"${l}"`).join(", ");
@@ -257,7 +313,7 @@ function removeLabel(client: GitHubClient, issue_number: number) {
       });
     } catch (error) {
       console.log(
-        `Could not remove label "${name}" from issue #${issue_number}`
+        `Could not remove label "${name}" from issue #${issue_number}`,
       );
       throw error;
     }
